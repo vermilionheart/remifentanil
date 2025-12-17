@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>レミフェンタニル：ステップ投与→終了後Z分濃度（Minto）</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; max-width:820px; margin:18px;}
+    .card{border:1px solid #ddd; border-radius:12px; padding:14px; margin:12px 0;}
+    .grid{display:grid; grid-template-columns: repeat(2, minmax(240px, 1fr)); gap:12px;}
+    label{display:block; font-size:12px; color:#333; margin-bottom:4px;}
+    input,select,textarea{width:100%; padding:9px; font-size:14px; box-sizing:border-box;}
+    textarea{min-height:140px; font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace;}
+    button{padding:10px 14px; font-size:14px; cursor:pointer;}
+    .muted{color:#666; font-size:12px; line-height:1.4;}
+    .big{font-size:26px; font-weight:800;}
+    .row{display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end;}
+    .row > div{flex:1; min-width:220px;}
+  </style>
+</head>
+<body>
+  <h2>レミフェンタニル：ステップ投与 → 投与終了後Z分の濃度（Minto）</h2>
+  <div class="muted">出力単位：ng/mL（血漿中濃度 / 効果部位濃度）</div>
+
+  <div class="card">
+    <h3>患者</h3>
+    <div class="grid">
+      <div><label>年齢 (yr)</label><input id="age" type="number" value="40" min="0" step="1"></div>
+      <div><label>性別</label>
+        <select id="sex"><option value="male" selected>Male</option><option value="female">Female</option></select>
+      </div>
+      <div><label>身長 (cm)</label><input id="height" type="number" value="170" min="30" step="0.1"></div>
+      <div><label>体重 (kg)</label><input id="weight" type="number" value="70" min="1" step="0.1"></div>
+      <div><label>計算刻み dt (s)</label><input id="dt" type="number" value="1" min="0.1" step="0.1"></div>
+      <div><label>投与終了後 Z (min)</label><input id="Z" type="number" value="10" min="0" step="0.1"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>ステップ投与（定速×区間）</h3>
+    <div class="muted">
+      1行 = 「投与速度(µg/kg/min), 継続時間(min)」<br>
+      例：0.2を30分 → 0.1を20分 → 0.3を10分
+    </div>
+    <textarea id="steps">0.2, 30
+0.1, 20
+0.3, 10</textarea>
+
+    <div class="row" style="margin-top:10px;">
+      <div><button id="btn">計算</button></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div>投与終了後 <span id="zLabel" class="big">--</span> 分の濃度：</div>
+    <div style="margin-top:6px;">血漿中濃度 = <span id="plasma" class="big">--</span> ng/mL</div>
+    <div>効果部位濃度 = <span id="effect" class="big">--</span> ng/mL</div>
+    <div class="muted" id="meta" style="margin-top:8px;"></div>
+  </div>
+
+<script>
+  // --- James LBM ---
+  function leanBodyMassJames(sex, W, Hcm){
+    return (sex==="male")
+      ? 1.10*W - 128*(W*W)/(Hcm*Hcm)
+      : 1.07*W - 148*(W*W)/(Hcm*Hcm);
+  }
+
+  // --- Minto parameters ---
+  function mintoParameters(age, heightCm, weightKg, sex){
+    const LBM = leanBodyMassJames(sex, weightKg, heightCm);
+    const V1 = (5.1 - 0.0201*(age-40) + 0.072*(LBM-55)); // L
+    const V2 = (9.82 - 0.0811*(age-40) + 0.108*(LBM-55)); // L
+    const V3 = 5.42; // L
+    const k10 = (2.6 - 0.0162*(age-40) + 0.0191*(LBM-55)) / V1;
+    const k12 = (2.05 - 0.0301*(age-40)) / V1;
+    const k13 = (0.076 - 0.00113*(age-40)) / V1;
+    const k21 = k12 * V1 / V2;
+    const k31 = k13 * V1 / V3;
+
+    let ke0 = 0.595 - 0.007*(age - 40);
+    if(ke0 < 1e-6) ke0 = 1e-6;
+
+    return {LBM, V1, V2, V3, k10, k12, k13, k21, k31, ke0};
+  }
+
+  // --- parse steps ---
+  function parseSteps(text){
+    const lines = text.split(/\r?\n/).map(s=>s.trim()).filter(s=>s && !s.startsWith("#"));
+    const steps = [];
+    for(const line of lines){
+      const parts = line.split(/[\s,]+/).filter(Boolean);
+      if(parts.length < 2) throw new Error(`形式エラー: "${line}"`);
+      const rate = parseFloat(parts[0]);
+      const dur  = parseFloat(parts[1]);
+      if(!Number.isFinite(rate) || !Number.isFinite(dur) || dur < 0) throw new Error(`値エラー: "${line}"`);
+      steps.push({rate_ugkgmin: rate, dur_min: dur});
+    }
+    if(!steps.length) throw new Error("ステップが空です");
+    return steps;
+  }
+
+  // --- ODE ---
+  // 状態：中心/末梢の量(µg)＋効果部位濃度(ng/mL)
+  function deriv(s, infusion_ug_per_min, p){
+    const dA1 = infusion_ug_per_min - (p.k10+p.k12+p.k13)*s.A1 + p.k21*s.A2 + p.k31*s.A3;
+    const dA2 = p.k12*s.A1 - p.k21*s.A2;
+    const dA3 = p.k13*s.A1 - p.k31*s.A3;
+
+    const plasma = s.A1 / p.V1;              // ng/mL (µg/Lと同値)
+    const dEffect = p.ke0 * (plasma - s.effect);
+
+    return {dA1,dA2,dA3,dEffect};
+  }
+
+  function add(s, k, f){
+    return {A1:s.A1+f*k.dA1, A2:s.A2+f*k.dA2, A3:s.A3+f*k.dA3, effect:s.effect+f*k.dEffect};
+  }
+
+  function rk4(s, infusion, p, dtMin){
+    const k1 = deriv(s, infusion, p);
+    const k2 = deriv(add(s,k1,dtMin/2), infusion, p);
+    const k3 = deriv(add(s,k2,dtMin/2), infusion, p);
+    const k4 = deriv(add(s,k3,dtMin), infusion, p);
+    return {
+      A1: s.A1 + (dtMin/6)*(k1.dA1 + 2*k2.dA1 + 2*k3.dA1 + k4.dA1),
+      A2: s.A2 + (dtMin/6)*(k1.dA2 + 2*k2.dA2 + 2*k3.dA2 + k4.dA2),
+      A3: s.A3 + (dtMin/6)*(k1.dA3 + 2*k2.dA3 + 2*k3.dA3 + k4.dA3),
+      effect: s.effect + (dtMin/6)*(k1.dEffect + 2*k2.dEffect + 2*k3.dEffect + k4.dEffect),
+    };
+  }
+
+  function simulateStepsAndAfter({age,height,weight,sex,dtSec,steps,Zmin}){
+    const p = mintoParameters(age,height,weight,sex);
+    const dtMin = dtSec/60.0;
+    let s = {A1:0, A2:0, A3:0, effect:0};
+    let totalMin = 0;
+
+    for(const st of steps){
+      const infusion = st.rate_ugkgmin * weight; // µg/min
+      const n = Math.max(0, Math.round(st.dur_min/dtMin));
+      for(let i=0;i<n;i++) s = rk4(s, infusion, p, dtMin);
+      totalMin += st.dur_min;
+    }
+
+    // stop then Z
+    const nZ = Math.max(0, Math.round(Zmin/dtMin));
+    for(let i=0;i<nZ;i++) s = rk4(s, 0.0, p, dtMin);
+
+    const plasma = s.A1 / p.V1;
+    const effect = s.effect;
+    return {plasma, effect, p, totalMin};
+  }
+
+  const fmt = (x,d=3)=> (Number.isFinite(x)? x.toFixed(d): "NaN");
+
+  document.getElementById("btn").addEventListener("click", ()=>{
+    try{
+      const age = +document.getElementById("age").value;
+      const sex = document.getElementById("sex").value;
+      const height = +document.getElementById("height").value;
+      const weight = +document.getElementById("weight").value;
+      const dtSec = +document.getElementById("dt").value;
+      const Zmin = +document.getElementById("Z").value;
+      const steps = parseSteps(document.getElementById("steps").value);
+
+      const r = simulateStepsAndAfter({age,height,weight,sex,dtSec,steps,Zmin});
+
+      document.getElementById("zLabel").textContent = fmt(Zmin,1);
+      document.getElementById("plasma").textContent = fmt(r.plasma,3);
+      document.getElementById("effect").textContent = fmt(r.effect,3);
+
+      document.getElementById("meta").textContent =
+        `投与総時間=${fmt(r.totalMin,1)} min / 参考：LBM=${fmt(r.p.LBM,2)} kg, V1=${fmt(r.p.V1,3)} L, ke0=${fmt(r.p.ke0,4)}/min`;
+    }catch(e){
+      document.getElementById("meta").textContent = "エラー: " + e.message;
+    }
+  });
+
+  // auto
+  document.getElementById("btn").click();
+</script>
+</body>
+</html>
